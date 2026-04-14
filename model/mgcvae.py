@@ -65,6 +65,8 @@ class MultimodalGenerativeCVAE(object):
                            model_if_absent=nn.LSTM(input_size=self.state_length,
                                                    hidden_size=self.hyperparams['enc_rnn_dim_history'],
                                                    batch_first=True))
+        
+        
 
         ###########################
         #   Node Future Encoder   #
@@ -949,80 +951,195 @@ class MultimodalGenerativeCVAE(object):
         return log_p_y_xz
 
     def train_loss(self,
-                   inputs,
-                   inputs_st,
-                   first_history_indices,
-                   labels,
-                   labels_st,
-                   neighbors,
-                   neighbors_edge_value,
-                   robot,
-                   map,
-                   prediction_horizon) -> torch.Tensor:
-        """
-        Calculates the training loss for a batch.
+                inputs,
+                inputs_st,
+                first_history_indices,
+                labels,
+                labels_st,
+                neighbors,
+                neighbors_edge_value,
+                robot,
+                map,
+                prediction_horizon) -> torch.Tensor:
 
-        :param inputs: Input tensor including the state for each agent over time [bs, t, state].
-        :param inputs_st: Standardized input tensor.
-        :param first_history_indices: First timestep (index) in scene for which data is available for a node [bs]
-        :param labels: Label tensor including the label output for each agent over time [bs, t, pred_state].
-        :param labels_st: Standardized label tensor.
-        :param neighbors: Preprocessed dict (indexed by edge type) of list of neighbor states over time.
-                            [[bs, t, neighbor state]]
-        :param neighbors_edge_value: Preprocessed edge values for all neighbor nodes [[N]]
-        :param robot: Standardized robot state over time. [bs, t, robot_state]
-        :param map: Tensor of Map information. [bs, channels, x, y]
-        :param prediction_horizon: Number of prediction timesteps.
-        :return: Scalar tensor -> nll loss
-        """
         mode = ModeKeys.TRAIN
 
-        x, x_nr_t, y_e, y_r, y, n_s_t0 = self.obtain_encoded_tensors(mode=mode,
-                                                                     inputs=inputs,
-                                                                     inputs_st=inputs_st,
-                                                                     labels=labels,
-                                                                     labels_st=labels_st,
-                                                                     first_history_indices=first_history_indices,
-                                                                     neighbors=neighbors,
-                                                                     neighbors_edge_value=neighbors_edge_value,
-                                                                     robot=robot,
-                                                                     map=map)
+        # =========================
+        # CLEAN PASS
+        # =========================
+        x, x_nr_t, y_e, y_r, y, n_s_t0 = self.obtain_encoded_tensors(
+            mode=mode,
+            inputs=inputs,
+            inputs_st=inputs_st,
+            labels=labels,
+            labels_st=labels_st,
+            first_history_indices=first_history_indices,
+            neighbors=neighbors,
+            neighbors_edge_value=neighbors_edge_value,
+            robot=robot,
+            map=map
+        )
 
-        z, kl = self.encoder(mode, x, y_e)
-        log_p_y_xz = self.decoder(mode, x, x_nr_t, y, y_r, n_s_t0, z,
-                                  labels,  # Loss is calculated on unstandardized label
-                                  prediction_horizon,
-                                  self.hyperparams['k'])
+        z_clean, kl = self.encoder(mode, x, y_e)
 
-        log_p_y_xz_mean = torch.mean(log_p_y_xz, dim=0)  # [nbs]
+        log_p_y_xz = self.decoder(
+            mode,
+            x,
+            x_nr_t,
+            y,
+            y_r,
+            n_s_t0,
+            z_clean,
+            labels,
+            prediction_horizon,
+            self.hyperparams['k']
+        )
+
+        pred_clean = log_p_y_xz  # 🔥 STORE CLEAN PREDICTION
+
+        log_p_y_xz_mean = torch.mean(log_p_y_xz, dim=0)
         log_likelihood = torch.mean(log_p_y_xz_mean)
 
         mutual_inf_q = mutual_inf_mc(self.latent.q_dist)
         mutual_inf_p = mutual_inf_mc(self.latent.p_dist)
 
         ELBO = log_likelihood - self.kl_weight * kl + 1. * mutual_inf_p
-        loss = -ELBO
+        loss_clean = -ELBO
 
+
+        # =========================
+        # NOISY PASS
+        # =========================
+        noise_std = 0.10
+        # -------- MULTI-NOISE --------
+
+        # Gaussian noise
+        noise1 = torch.randn_like(inputs) * 0.1
+        inputs_noisy1 = inputs + noise1
+
+        # Missing data (mask noise)
+        mask = (torch.rand_like(inputs) > 0.2).float()
+        inputs_noisy2 = inputs * mask
+
+        # -------- NOISY PASS 1 (Gaussian) --------
+        x_n1, x_nr_t_n1, y_e_n1, y_r_n1, y_n1, n_s_t0_n1 = self.obtain_encoded_tensors(
+            mode=mode,
+            inputs=inputs_noisy1,
+            inputs_st=inputs_st,
+            labels=labels,
+            labels_st=labels_st,
+            first_history_indices=first_history_indices,
+            neighbors=neighbors,
+            neighbors_edge_value=neighbors_edge_value,
+            robot=robot,
+            map=map
+        )
+
+        z_noisy1, _ = self.encoder(mode, x_n1, y_e_n1)
+
+        pred_noisy1 = self.decoder(
+            mode,
+            x_n1,
+            x_nr_t_n1,
+            y_n1,
+            y_r_n1,
+            n_s_t0_n1,
+            z_noisy1,
+            labels,
+            prediction_horizon,
+            self.hyperparams['k']
+        )
+
+
+        # -------- NOISY PASS 2 (Mask) --------
+        x_n2, x_nr_t_n2, y_e_n2, y_r_n2, y_n2, n_s_t0_n2 = self.obtain_encoded_tensors(
+            mode=mode,
+            inputs=inputs_noisy2,
+            inputs_st=inputs_st,
+            labels=labels,
+            labels_st=labels_st,
+            first_history_indices=first_history_indices,
+            neighbors=neighbors,
+            neighbors_edge_value=neighbors_edge_value,
+            robot=robot,
+            map=map
+        )
+
+        z_noisy2, _ = self.encoder(mode, x_n2, y_e_n2)
+
+        pred_noisy2 = self.decoder(
+            mode,
+            x_n2,
+            x_nr_t_n2,
+            y_n2,
+            y_r_n2,
+            n_s_t0_n2,
+            z_noisy2,
+            labels,
+            prediction_horizon,
+            self.hyperparams['k']
+        )
+
+
+        # =========================
+        # CONSISTENCY LOSS
+        # =========================
+        pred_clean = pred_clean.detach()
+
+        # confidence from clean prediction
+        confidence = torch.exp(pred_clean)
+
+        mask_conf = (confidence > 0.5).float()
+
+        consistency_loss = (
+            torch.mean(mask_conf * torch.abs(pred_clean - pred_noisy1)) +
+            torch.mean(mask_conf * torch.abs(pred_clean - pred_noisy2))
+        )
+
+        lambda_consistency = min(0.5, self.curr_iter * 0.0001)
+
+        # =========================
+        # FINAL LOSS
+        # =========================
+        # detach clean prediction (VERY IMPORTANT)
+        pred_clean = pred_clean.detach()
+
+        # apply consistency only sometimes
+        if torch.rand(1).item() < 0.3:
+            loss = loss_clean + lambda_consistency * consistency_loss
+        else:
+            loss = loss_clean
+
+
+        # =========================
+        # LOGGING
+        # =========================
         if self.hyperparams['log_histograms'] and self.log_writer is not None:
             self.log_writer.add_histogram('%s/%s' % (str(self.node_type), 'log_p_y_xz'),
-                                          log_p_y_xz_mean,
-                                          self.curr_iter)
+                                        log_p_y_xz_mean,
+                                        self.curr_iter)
 
         if self.log_writer is not None:
             self.log_writer.add_scalar('%s/%s' % (str(self.node_type), 'mutual_information_q'),
-                                       mutual_inf_q,
-                                       self.curr_iter)
+                                    mutual_inf_q,
+                                    self.curr_iter)
             self.log_writer.add_scalar('%s/%s' % (str(self.node_type), 'mutual_information_p'),
-                                       mutual_inf_p,
-                                       self.curr_iter)
+                                    mutual_inf_p,
+                                    self.curr_iter)
             self.log_writer.add_scalar('%s/%s' % (str(self.node_type), 'log_likelihood'),
-                                       log_likelihood,
-                                       self.curr_iter)
+                                    log_likelihood,
+                                    self.curr_iter)
             self.log_writer.add_scalar('%s/%s' % (str(self.node_type), 'loss'),
-                                       loss,
-                                       self.curr_iter)
+                                    loss,
+                                    self.curr_iter)
+
             if self.hyperparams['log_histograms']:
-                self.latent.summarize_for_tensorboard(self.log_writer, str(self.node_type), self.curr_iter)
+                self.latent.summarize_for_tensorboard(
+                    self.log_writer,
+                    str(self.node_type),
+                    self.curr_iter
+                )
+
         return loss
 
     def eval_loss(self,

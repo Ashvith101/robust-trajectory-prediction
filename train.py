@@ -148,6 +148,7 @@ def main():
 
     eval_scenes = []
     eval_scenes_sample_probs = None
+    
     if args.eval_every is not None:
         eval_data_path = os.path.join(args.data_dir, args.eval_data_dict)
         with open(eval_data_path, 'rb') as f:
@@ -243,6 +244,7 @@ def main():
     #           TRAINING            #
     #################################
     curr_iter_node_type = {node_type: 0 for node_type in train_data_loader.keys()}
+    hyperparams["is_eval"] = False
     for epoch in range(1, args.train_epochs + 1):
         model_registrar.to(args.device)
         train_dataset.augment = args.augment
@@ -282,6 +284,7 @@ def main():
         if args.vis_every is not None and not args.debug and epoch % args.vis_every == 0 and epoch > 0:
             max_hl = hyperparams['maximum_history_length']
             ph = hyperparams['prediction_horizon']
+            hyperparams["is_eval"] = True
             with torch.no_grad():
                 # Predict random timestep to plot for train data set
                 if args.scene_freq_mult_viz:
@@ -355,87 +358,79 @@ def main():
                                                    map=scene.map['VISUALIZATION'] if scene.map is not None else None)
                 ax.set_title(f"{scene.name}-t: {timestep}")
                 log_writer.add_figure('eval/prediction_all_z', fig, epoch)
+                hyperparams["is_eval"] = False
 
         #################################
         #           EVALUATION          #
         #################################
+
+        os.makedirs("../results", exist_ok=True)
+        results_file = "../results/results.csv"
+
+        # create header if file doesn't exist
+        if not os.path.exists(results_file):
+            with open(results_file, "w") as f:
+                f.write("exp_name,epoch,node_type,mean,median,min,max\n")
+
         if args.eval_every is not None and not args.debug and epoch % args.eval_every == 0 and epoch > 0:
             max_hl = hyperparams['maximum_history_length']
             ph = hyperparams['prediction_horizon']
+
             model_registrar.to(args.eval_device)
+
+            # ✅ IMPORTANT: SWITCH TO EVAL MODE
+            hyperparams["is_eval"] = True
+
+            exp_name = hyperparams.get("exp_name", "default_exp")
+
             with torch.no_grad():
-                # Calculate evaluation loss
                 for node_type, data_loader in eval_data_loader.items():
                     eval_loss = []
                     print(f"Starting Evaluation @ epoch {epoch} for node type: {node_type}")
                     pbar = tqdm(data_loader, ncols=80)
+
                     for batch in pbar:
                         eval_loss_node_type = eval_trajectron.eval_loss(batch, node_type)
-                        pbar.set_description(f"Epoch {epoch}, {node_type} L: {eval_loss_node_type.item():.2f}")
-                        eval_loss.append({node_type: {'nll': [eval_loss_node_type]}})
+                        val = eval_loss_node_type.item()
+
+                        pbar.set_description(
+                            f"Epoch {epoch}, {node_type} L: {val:.2f}"
+                        )
+
+                        eval_loss.append(val)
                         del batch
 
-                    evaluation.log_batch_errors(eval_loss,
-                                                log_writer,
-                                                f"{node_type}/eval_loss",
-                                                epoch)
+                    # 🔥 Compute statistics
+                    avg_eval_loss = np.mean(eval_loss)
+                    median_eval_loss = np.median(eval_loss)
+                    min_eval_loss = np.min(eval_loss)
+                    max_eval_loss = np.max(eval_loss)
 
-                # Predict batch timesteps for evaluation dataset evaluation
-                eval_batch_errors = []
-                for scene in tqdm(eval_scenes, desc='Sample Evaluation', ncols=80):
-                    timesteps = scene.sample_timesteps(args.eval_batch_size)
+                    print(
+                        f"[RESULT] {exp_name} | Epoch {epoch} | {node_type} | "
+                        f"Mean: {avg_eval_loss:.4f} | Median: {median_eval_loss:.4f} | "
+                        f"Min: {min_eval_loss:.4f} | Max: {max_eval_loss:.4f}"
+                    )
 
-                    predictions = eval_trajectron.predict(scene,
-                                                          timesteps,
-                                                          ph,
-                                                          num_samples=50,
-                                                          min_future_timesteps=ph,
-                                                          full_dist=False)
+                    with open(results_file, "a") as f:
+                        f.write(
+                            f"{exp_name},{epoch},{node_type},"
+                            f"{avg_eval_loss},{median_eval_loss},{min_eval_loss},{max_eval_loss}\n"
+                        )
 
-                    eval_batch_errors.append(evaluation.compute_batch_statistics(predictions,
-                                                                                 scene.dt,
-                                                                                 max_hl=max_hl,
-                                                                                 ph=ph,
-                                                                                 node_type_enum=eval_env.NodeType,
-                                                                                 map=scene.map))
+                    evaluation.log_batch_errors(
+                        [{node_type: {'nll': [torch.tensor(l)]}} for l in eval_loss],
+                        log_writer,
+                        f"{node_type}/eval_loss",
+                        epoch
+                    )
 
-                evaluation.log_batch_errors(eval_batch_errors,
-                                            log_writer,
-                                            'eval',
-                                            epoch,
-                                            bar_plot=['kde'],
-                                            box_plot=['ade', 'fde'])
+            # ✅ IMPORTANT: SWITCH BACK TO TRAIN MODE
+            hyperparams["is_eval"] = False
 
-                # Predict maximum likelihood batch timesteps for evaluation dataset evaluation
-                eval_batch_errors_ml = []
-                for scene in tqdm(eval_scenes, desc='MM Evaluation', ncols=80):
-                    timesteps = scene.sample_timesteps(scene.timesteps)
-
-                    predictions = eval_trajectron.predict(scene,
-                                                          timesteps,
-                                                          ph,
-                                                          num_samples=1,
-                                                          min_future_timesteps=ph,
-                                                          z_mode=True,
-                                                          gmm_mode=True,
-                                                          full_dist=False)
-
-                    eval_batch_errors_ml.append(evaluation.compute_batch_statistics(predictions,
-                                                                                    scene.dt,
-                                                                                    max_hl=max_hl,
-                                                                                    ph=ph,
-                                                                                    map=scene.map,
-                                                                                    node_type_enum=eval_env.NodeType,
-                                                                                    kde=False))
-
-                evaluation.log_batch_errors(eval_batch_errors_ml,
-                                            log_writer,
-                                            'eval/ml',
-                                            epoch)
-
-        if args.save_every is not None and args.debug is False and epoch % args.save_every == 0:
-            model_registrar.save_models(epoch)
-
-
+            # Save model
+            if args.save_every is not None and not args.debug and epoch % args.save_every == 0:
+                model_registrar.save_models(epoch)
+        
 if __name__ == '__main__':
     main()
